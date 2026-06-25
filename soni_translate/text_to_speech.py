@@ -8,6 +8,7 @@ from .language_configuration import (
     fix_code_language,
     BARK_VOICES_LIST,
     VITS_VOICES_LIST,
+    VIENEU_VOICES_LIST,
 )
 from .utils import (
     download_manager,
@@ -1124,6 +1125,113 @@ def segments_openai_tts(
             future.result()
 
 
+def vieneu_tts_voices_list():
+    return list(VIENEU_VOICES_LIST.keys())
+
+
+def _vieneu_build_batch_request(segment, preset):
+    return {
+        "text": segment["text"],
+        "ref_codes": preset["codes"],
+        "voice_token_id": preset.get("reserved_id"),
+    }
+
+
+def _vieneu_apply_watermark(model, wav):
+    if hasattr(model, "_apply_watermark"):
+        return model._apply_watermark(wav)
+    return wav
+
+
+def segments_vieneu_tts(filtered_vieneu_segments, TRANSLATE_AUDIO_TO):
+    try:
+        from vieneu import Vieneu
+    except ImportError as error:
+        raise TTS_OperationError(
+            "VieNeu-TTS is not installed. Install it with: pip install vieneu"
+        ) from error
+
+    if TRANSLATE_AUDIO_TO[:2].lower() != "vi":
+        logger.warning(
+            "VieNeu-TTS is optimized for Vietnamese. "
+            f"Target language is '{TRANSLATE_AUDIO_TO}'."
+        )
+
+    device = os.environ.get("SONITR_DEVICE", "cpu")
+    vieneu_device = "cuda" if device == "cuda" else "cpu"
+    model = Vieneu(mode="v3turbo", device=vieneu_device)
+    sampling_rate = model.sample_rate
+    logger.info(
+        f"VieNeu-TTS v3 Turbo running on {vieneu_device} "
+        f"(backend={getattr(model, 'backend', 'unknown')})"
+    )
+
+    batch_engine = None
+    if getattr(model, "backend", None) == "pytorch" and vieneu_device == "cuda":
+        try:
+            from vieneu.v3_turbo_serve.engine import V3TurboBatchEngine
+
+            batch_engine = V3TurboBatchEngine(model.engine)
+            logger.info("VieNeu-TTS GPU batch engine enabled")
+        except Exception as error:
+            logger.warning(f"VieNeu-TTS batch engine unavailable: {error}")
+
+    grouped_segments = group_segments_by_key(
+        filtered_vieneu_segments["segments"], lambda s: s["tts_name"]
+    )
+
+    for tts_name, voice_segments in grouped_segments.items():
+        voice_id = VIENEU_VOICES_LIST[tts_name]
+        preset = model.get_preset_voice(voice_id)
+
+        for batch in tqdm(
+            list(iter_segment_batches(voice_segments)),
+            desc=f"VieNeu-TTS ({voice_id})",
+        ):
+            if batch_engine and len(batch) > 1:
+                try:
+                    requests = [
+                        _vieneu_build_batch_request(segment, preset)
+                        for segment in batch
+                    ]
+                    wavs = batch_engine.generate_batch(requests)
+                    for segment, wav in zip(batch, wavs):
+                        audio_data = _vieneu_apply_watermark(model, wav)
+                        save_tts_segment_file(
+                            segment,
+                            audio_data,
+                            sampling_rate,
+                            TRANSLATE_AUDIO_TO,
+                        )
+                    continue
+                except Exception as batch_error:
+                    logger.warning(
+                        "VieNeu-TTS batch inference failed, falling back to "
+                        f"single segment mode: {batch_error}"
+                    )
+
+            for segment in batch:
+                try:
+                    wav = model.infer(segment["text"], voice=voice_id)
+                    save_tts_segment_file(
+                        segment, wav, sampling_rate, TRANSLATE_AUDIO_TO
+                    )
+                except Exception as error:
+                    error_handling_in_tts(
+                        error,
+                        segment,
+                        TRANSLATE_AUDIO_TO,
+                        f"audio/{segment['start']}.ogg",
+                    )
+
+    try:
+        model.close()
+    except Exception as error:
+        logger.error(str(error))
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 # =====================================
 # Select task TTS
 # =====================================
@@ -1207,6 +1315,7 @@ def audio_segmentation_to_voice(
     pattern_coqui = re.compile(r".+\.(wav|mp3|ogg|m4a)$")
     pattern_vits_onnx = re.compile(r".* VITS-onnx$")
     pattern_openai_tts = re.compile(r".* OpenAI-TTS$")
+    pattern_vieneu = re.compile(r".* VieNeu-TTS$")
 
     all_segments = result_diarize["segments"]
 
@@ -1220,6 +1329,7 @@ def audio_segmentation_to_voice(
     speakers_openai_tts = find_spkr(
         pattern_openai_tts, speaker_to_voice, all_segments
     )
+    speakers_vieneu = find_spkr(pattern_vieneu, speaker_to_voice, all_segments)
 
     # Filter method in segments
     filtered_edge = filter_by_speaker(speakers_edge, all_segments)
@@ -1228,6 +1338,7 @@ def audio_segmentation_to_voice(
     filtered_coqui = filter_by_speaker(speakers_coqui, all_segments)
     filtered_vits_onnx = filter_by_speaker(speakers_vits_onnx, all_segments)
     filtered_openai_tts = filter_by_speaker(speakers_openai_tts, all_segments)
+    filtered_vieneu = filter_by_speaker(speakers_vieneu, all_segments)
 
     # Infer
     if filtered_edge["segments"]:
@@ -1257,6 +1368,9 @@ def audio_segmentation_to_voice(
     if filtered_openai_tts["segments"]:
         logger.info(f"OpenAI TTS: {speakers_openai_tts}")
         segments_openai_tts(filtered_openai_tts, TRANSLATE_AUDIO_TO)  # wav
+    if filtered_vieneu["segments"]:
+        logger.info(f"VieNeu-TTS: {speakers_vieneu}")
+        segments_vieneu_tts(filtered_vieneu, TRANSLATE_AUDIO_TO)
 
     [result.pop("tts_name", None) for result in result_diarize["segments"]]
     return [
@@ -1265,7 +1379,8 @@ def audio_segmentation_to_voice(
         speakers_vits,
         speakers_coqui,
         speakers_vits_onnx,
-        speakers_openai_tts
+        speakers_openai_tts,
+        speakers_vieneu,
     ]
 
 
@@ -1284,8 +1399,10 @@ def accelerate_segments(
         speakers_vits,
         speakers_coqui,
         speakers_vits_onnx,
-        speakers_openai_tts
+        speakers_openai_tts,
+        *rest,
     ) = valid_speakers
+    speakers_vieneu = rest[0] if rest else []
 
     create_directories(f"{folder_output}/audio/")
     remove_directory_contents(f"{folder_output}/audio/")

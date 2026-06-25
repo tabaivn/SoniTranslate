@@ -23,6 +23,7 @@ from soni_translate.text_to_speech import (
     edge_tts_voices_list,
     coqui_xtts_voices_list,
     piper_tts_voices_list,
+    vieneu_tts_voices_list,
     create_wav_file_vc,
     accelerate_segments,
 )
@@ -125,7 +126,7 @@ directories = [
 
 
 class TTS_Info:
-    def __init__(self, piper_enabled, xtts_enabled):
+    def __init__(self, piper_enabled, xtts_enabled, vieneu_enabled=False):
         self.list_edge = edge_tts_voices_list()
         self.list_bark = list(BARK_VOICES_LIST.keys())
         self.list_vits = list(VITS_VOICES_LIST.keys())
@@ -135,6 +136,10 @@ class TTS_Info:
             piper_tts_voices_list() if self.piper_enabled else []
         )
         self.xtts_enabled = xtts_enabled
+        self.vieneu_enabled = vieneu_enabled
+        self.list_vieneu = (
+            vieneu_tts_voices_list() if self.vieneu_enabled else []
+        )
 
     def tts_list(self):
         self.list_coqui_xtts = (
@@ -146,6 +151,7 @@ class TTS_Info:
             + self.list_vits
             + self.list_openai_tts
             + self.list_vits_onnx
+            + self.list_vieneu
         )
         return list_tts
 
@@ -329,8 +335,17 @@ class SoniTranslate(SoniTrCache):
             logger.debug(str(error))
             xtts_enabled = False
             logger.info("Coqui XTTS disabled")
+        try:
+            from vieneu import Vieneu  # noqa
 
-        self.tts_info = TTS_Info(piper_enabled, xtts_enabled)
+            vieneu_enabled = True
+            logger.info("VieNeu-TTS enabled")
+        except Exception as error:
+            logger.debug(str(error))
+            vieneu_enabled = False
+            logger.info("VieNeu-TTS disabled")
+
+        self.tts_info = TTS_Info(piper_enabled, xtts_enabled, vieneu_enabled)
 
         return self.tts_info.tts_list()
 

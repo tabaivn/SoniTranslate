@@ -490,6 +490,19 @@ OPENAI_TTS_CODES = [
     "sv", "tl", "ta", "th", "tr", "uk", "ur", "vi", "cy", "zh-TW"
 ]
 
+VIENEU_VOICES_LIST = {
+    "vi-Ngọc Lan VieNeu-TTS": "Ngọc Lan",
+    "vi-Ngọc Linh VieNeu-TTS": "Ngọc Linh",
+    "vi-Trúc Ly VieNeu-TTS": "Trúc Ly",
+    "vi-Mỹ Duyên VieNeu-TTS": "Mỹ Duyên",
+    "vi-Xuân Vĩnh VieNeu-TTS": "Xuân Vĩnh",
+    "vi-Thái Sơn VieNeu-TTS": "Thái Sơn",
+    "vi-Gia Bảo VieNeu-TTS": "Gia Bảo",
+    "vi-Đức Trí VieNeu-TTS": "Đức Trí",
+    "vi-Trọng Hữu VieNeu-TTS": "Trọng Hữu",
+    "vi-Bình An VieNeu-TTS": "Bình An",
+}
+
 OPENAI_TTS_MODELS = [
     ">alloy OpenAI-TTS",
     ">echo OpenAI-TTS",
