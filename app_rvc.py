@@ -1,4 +1,14 @@
 import gradio as gr
+import torch
+from unittest.mock import patch
+
+# Bẻ hướng cấu hình weights_only luôn bằng False bất kể thư viện nào gọi torch.load
+orig_torch_load = torch.load
+def patched_torch_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return orig_torch_load(*args, **kwargs)
+
+torch.load = patched_torch_load
 from soni_translate.logging_setup import (
     logger,
     set_logging_level,

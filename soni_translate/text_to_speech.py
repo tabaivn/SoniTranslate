@@ -2,6 +2,8 @@ from gtts import gTTS
 import edge_tts, asyncio, json, glob # noqa
 from tqdm import tqdm
 import librosa, os, re, torch, gc, subprocess # noqa
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .language_configuration import (
     fix_code_language,
     BARK_VOICES_LIST,
@@ -106,6 +108,43 @@ def pad_array(array, sr):
         return array
 
 
+def get_tts_batch_size():
+    try:
+        return max(1, int(os.environ.get("SONITR_TTS_BATCH_SIZE", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def iter_segment_batches(segments, batch_size=None):
+    batch_size = batch_size or get_tts_batch_size()
+    for i in range(0, len(segments), batch_size):
+        yield segments[i:i + batch_size]
+
+
+def group_segments_by_key(segments, key_fn):
+    groups = defaultdict(list)
+    for segment in segments:
+        groups[key_fn(segment)].append(segment)
+    return dict(groups)
+
+
+def save_tts_segment_file(segment, audio_data, sampling_rate, translate_audio_to):
+    filename = f"audio/{segment['start']}.ogg"
+    logger.info(f"{segment['text']} >> {filename}")
+    try:
+        data_tts = pad_array(audio_data, sampling_rate)
+        write_chunked(
+            file=filename,
+            samplerate=sampling_rate,
+            data=data_tts,
+            format="ogg",
+            subtype="vorbis",
+        )
+        verify_saved_file_and_size(filename)
+    except Exception as error:
+        error_handling_in_tts(error, segment, translate_audio_to, filename)
+
+
 # =====================================
 # EDGE TTS
 # =====================================
@@ -154,47 +193,104 @@ def edge_tts_voices_list():
     return formatted_voices
 
 
-def segments_egde_tts(filtered_edge_segments, TRANSLATE_AUDIO_TO, is_gui):
-    for segment in tqdm(filtered_edge_segments["segments"]):
-        speaker = segment["speaker"] # noqa
-        text = segment["text"]
-        start = segment["start"]
-        tts_name = segment["tts_name"]
+def _process_edge_segment(segment, TRANSLATE_AUDIO_TO, is_gui):
+    text = segment["text"]
+    start = segment["start"]
+    tts_name = segment["tts_name"]
+    filename = f"audio/{start}.ogg"
+    temp_file = filename[:-3] + "mp3"
 
-        # make the tts audio
-        filename = f"audio/{start}.ogg"
-        temp_file = filename[:-3] + "mp3"
-
-        logger.info(f"{text} >> {filename}")
-        try:
-            if is_gui:
-                asyncio.run(
-                    edge_tts.Communicate(
-                        text, "-".join(tts_name.split("-")[:-1])
-                    ).save(temp_file)
-                )
-            else:
-                # nest_asyncio.apply() if not is_gui else None
-                command = f'edge-tts -t "{text}" -v "{tts_name.replace("-Male", "").replace("-Female", "")}" --write-media "{temp_file}"'
-                run_command(command)
-            verify_saved_file_and_size(temp_file)
-
-            data, sample_rate = sf.read(temp_file)
-            data = pad_array(data, sample_rate)
-            # os.remove(temp_file)
-
-            # Save file
-            write_chunked(
-                file=filename,
-                samplerate=sample_rate,
-                data=data,
-                format="ogg",
-                subtype="vorbis",
+    logger.info(f"{text} >> {filename}")
+    try:
+        if is_gui:
+            asyncio.run(
+                edge_tts.Communicate(
+                    text, "-".join(tts_name.split("-")[:-1])
+                ).save(temp_file)
             )
-            verify_saved_file_and_size(filename)
+        else:
+            command = (
+                f'edge-tts -t "{text}" -v '
+                f'"{tts_name.replace("-Male", "").replace("-Female", "")}" '
+                f'--write-media "{temp_file}"'
+            )
+            run_command(command)
+        verify_saved_file_and_size(temp_file)
 
-        except Exception as error:
-            error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
+        data, sample_rate = sf.read(temp_file)
+        data = pad_array(data, sample_rate)
+        write_chunked(
+            file=filename,
+            samplerate=sample_rate,
+            data=data,
+            format="ogg",
+            subtype="vorbis",
+        )
+        verify_saved_file_and_size(filename)
+    except Exception as error:
+        error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
+
+
+async def _edge_tts_batch_async(segments, translate_audio_to, is_gui, max_concurrent):
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def process_one(segment):
+        async with semaphore:
+            text = segment["text"]
+            start = segment["start"]
+            tts_name = segment["tts_name"]
+            filename = f"audio/{start}.ogg"
+            temp_file = filename[:-3] + "mp3"
+            logger.info(f"{text} >> {filename}")
+            try:
+                await edge_tts.Communicate(
+                    text, "-".join(tts_name.split("-")[:-1])
+                ).save(temp_file)
+                verify_saved_file_and_size(temp_file)
+                data, sample_rate = sf.read(temp_file)
+                data = pad_array(data, sample_rate)
+                write_chunked(
+                    file=filename,
+                    samplerate=sample_rate,
+                    data=data,
+                    format="ogg",
+                    subtype="vorbis",
+                )
+                verify_saved_file_and_size(filename)
+            except Exception as error:
+                error_handling_in_tts(
+                    error, segment, translate_audio_to, filename
+                )
+
+    await asyncio.gather(*[process_one(segment) for segment in segments])
+
+
+def segments_egde_tts(filtered_edge_segments, TRANSLATE_AUDIO_TO, is_gui):
+    segments = filtered_edge_segments["segments"]
+    batch_size = get_tts_batch_size()
+
+    if is_gui:
+        for batch in tqdm(
+            list(iter_segment_batches(segments, batch_size)),
+            desc="EDGE TTS",
+        ):
+            asyncio.run(
+                _edge_tts_batch_async(
+                    batch, TRANSLATE_AUDIO_TO, is_gui, batch_size
+                )
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+            futures = {
+                executor.submit(
+                    _process_edge_segment, segment, TRANSLATE_AUDIO_TO, is_gui
+                ): segment
+                for segment in segments
+            }
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="EDGE TTS"
+            ):
+                future.result()
 
 
 # =====================================
@@ -226,51 +322,77 @@ def segments_bark_tts(
         # model.enable_cpu_offload()
     sampling_rate = model.generation_config.sample_rate
 
-    # filtered_segments = filtered_bark_segments['segments']
-    # Sorting the segments by 'tts_name'
-    # sorted_segments = sorted(filtered_segments, key=lambda x: x['tts_name'])
-    # logger.debug(sorted_segments)
+    grouped_segments = group_segments_by_key(
+        filtered_bark_segments["segments"], lambda s: s["tts_name"]
+    )
 
-    for segment in tqdm(filtered_bark_segments["segments"]):
-        speaker = segment["speaker"] # noqa
-        text = segment["text"]
-        start = segment["start"]
-        tts_name = segment["tts_name"]
-
-        inputs = processor(text, voice_preset=BARK_VOICES_LIST[tts_name]).to(
-            device
-        )
-
-        # make the tts audio
-        filename = f"audio/{start}.ogg"
-        logger.info(f"{text} >> {filename}")
-        try:
-            # Infer
-            with torch.inference_mode():
-                speech_output = model.generate(
-                    **inputs,
-                    do_sample=True,
-                    fine_temperature=0.4,
-                    coarse_temperature=0.8,
-                    pad_token_id=processor.tokenizer.pad_token_id,
+    for tts_name, voice_segments in grouped_segments.items():
+        for batch in tqdm(
+            list(iter_segment_batches(voice_segments)),
+            desc=f"BARK TTS ({tts_name})",
+        ):
+            texts = [segment["text"] for segment in batch]
+            try:
+                inputs = processor(
+                    texts,
+                    voice_preset=BARK_VOICES_LIST[tts_name],
+                    padding=True,
+                    return_tensors="pt",
+                ).to(device)
+                with torch.inference_mode():
+                    speech_outputs = model.generate(
+                        **inputs,
+                        do_sample=True,
+                        fine_temperature=0.4,
+                        coarse_temperature=0.8,
+                        pad_token_id=processor.tokenizer.pad_token_id,
+                    )
+                for i, segment in enumerate(batch):
+                    audio_data = (
+                        speech_outputs[i]
+                        .cpu()
+                        .numpy()
+                        .squeeze()
+                        .astype(np.float32)
+                    )
+                    save_tts_segment_file(
+                        segment, audio_data, sampling_rate, TRANSLATE_AUDIO_TO
+                    )
+            except Exception as batch_error:
+                logger.warning(
+                    f"BARK batch inference failed, falling back to single "
+                    f"segment mode: {batch_error}"
                 )
-            # Save file
-            data_tts = pad_array(
-                speech_output.cpu().numpy().squeeze().astype(np.float32),
-                sampling_rate,
-            )
-            write_chunked(
-                file=filename,
-                samplerate=sampling_rate,
-                data=data_tts,
-                format="ogg",
-                subtype="vorbis",
-            )
-            verify_saved_file_and_size(filename)
-        except Exception as error:
-            error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
-        gc.collect()
-        torch.cuda.empty_cache()
+                for segment in batch:
+                    try:
+                        inputs = processor(
+                            segment["text"],
+                            voice_preset=BARK_VOICES_LIST[tts_name],
+                        ).to(device)
+                        with torch.inference_mode():
+                            speech_output = model.generate(
+                                **inputs,
+                                do_sample=True,
+                                fine_temperature=0.4,
+                                coarse_temperature=0.8,
+                                pad_token_id=processor.tokenizer.pad_token_id,
+                            )
+                        audio_data = (
+                            speech_output.cpu().numpy().squeeze().astype(
+                                np.float32
+                            )
+                        )
+                        save_tts_segment_file(
+                            segment,
+                            audio_data,
+                            sampling_rate,
+                            TRANSLATE_AUDIO_TO,
+                        )
+                    except Exception as error:
+                        error_handling_in_tts(
+                            error, segment, TRANSLATE_AUDIO_TO,
+                            f"audio/{segment['start']}.ogg",
+                        )
     try:
         del processor
         del model
@@ -326,66 +448,77 @@ def segments_vits_tts(filtered_vits_segments, TRANSLATE_AUDIO_TO):
     from transformers import VitsModel, AutoTokenizer
 
     filtered_segments = filtered_vits_segments["segments"]
-    # Sorting the segments by 'tts_name'
-    sorted_segments = sorted(filtered_segments, key=lambda x: x["tts_name"])
-    logger.debug(sorted_segments)
+    grouped_segments = group_segments_by_key(
+        filtered_segments, lambda s: s["tts_name"]
+    )
 
-    model_name_key = None
-    for segment in tqdm(sorted_segments):
-        speaker = segment["speaker"] # noqa
-        text = segment["text"]
-        start = segment["start"]
-        tts_name = segment["tts_name"]
+    for tts_name, voice_segments in grouped_segments.items():
+        model = VitsModel.from_pretrained(VITS_VOICES_LIST[tts_name])
+        tokenizer = AutoTokenizer.from_pretrained(VITS_VOICES_LIST[tts_name])
+        sampling_rate = model.config.sampling_rate
 
-        if tts_name != model_name_key:
-            model_name_key = tts_name
-            model = VitsModel.from_pretrained(VITS_VOICES_LIST[tts_name])
-            tokenizer = AutoTokenizer.from_pretrained(
-                VITS_VOICES_LIST[tts_name]
-            )
-            sampling_rate = model.config.sampling_rate
-
-        if tokenizer.is_uroman:
-            romanize_text = uromanize(text)
-            logger.debug(f"Romanize text: {romanize_text}")
-            inputs = tokenizer(romanize_text, return_tensors="pt")
-        else:
-            inputs = tokenizer(text, return_tensors="pt")
-
-        # make the tts audio
-        filename = f"audio/{start}.ogg"
-        logger.info(f"{text} >> {filename}")
+        for batch in tqdm(
+            list(iter_segment_batches(voice_segments)),
+            desc=f"VITS TTS ({tts_name})",
+        ):
+            texts = []
+            for segment in batch:
+                text = segment["text"]
+                if tokenizer.is_uroman:
+                    text = uromanize(text)
+                    logger.debug(f"Romanize text: {text}")
+                texts.append(text)
+            try:
+                inputs = tokenizer(texts, return_tensors="pt", padding=True)
+                with torch.no_grad():
+                    speech_outputs = model(**inputs).waveform
+                for i, segment in enumerate(batch):
+                    audio_data = (
+                        speech_outputs[i]
+                        .cpu()
+                        .numpy()
+                        .squeeze()
+                        .astype(np.float32)
+                    )
+                    save_tts_segment_file(
+                        segment, audio_data, sampling_rate, TRANSLATE_AUDIO_TO
+                    )
+            except Exception as batch_error:
+                logger.warning(
+                    f"VITS batch inference failed, falling back to single "
+                    f"segment mode: {batch_error}"
+                )
+                for segment in batch:
+                    try:
+                        text = segment["text"]
+                        if tokenizer.is_uroman:
+                            text = uromanize(text)
+                        inputs = tokenizer(text, return_tensors="pt")
+                        with torch.no_grad():
+                            speech_output = model(**inputs).waveform
+                        audio_data = (
+                            speech_output.cpu().numpy().squeeze().astype(
+                                np.float32
+                            )
+                        )
+                        save_tts_segment_file(
+                            segment,
+                            audio_data,
+                            sampling_rate,
+                            TRANSLATE_AUDIO_TO,
+                        )
+                    except Exception as error:
+                        error_handling_in_tts(
+                            error, segment, TRANSLATE_AUDIO_TO,
+                            f"audio/{segment['start']}.ogg",
+                        )
         try:
-            # Infer
-            with torch.no_grad():
-                speech_output = model(**inputs).waveform
-
-            data_tts = pad_array(
-                speech_output.cpu().numpy().squeeze().astype(np.float32),
-                sampling_rate,
-            )
-            # Save file
-            write_chunked(
-                file=filename,
-                samplerate=sampling_rate,
-                data=data_tts,
-                format="ogg",
-                subtype="vorbis",
-            )
-            verify_saved_file_and_size(filename)
+            del tokenizer
+            del model
         except Exception as error:
-            error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
-        gc.collect()
-        torch.cuda.empty_cache()
-    try:
-        del tokenizer
-        del model
-        gc.collect()
-        torch.cuda.empty_cache()
-    except Exception as error:
-        logger.error(str(error))
-        gc.collect()
-        torch.cuda.empty_cache()
+            logger.error(str(error))
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 # =====================================
@@ -582,6 +715,22 @@ def create_new_files_for_vc(
                     )
 
 
+def _resolve_coqui_speaker_wav(segment):
+    tts_name = segment["tts_name"]
+    if tts_name == "_XTTS_/AUTOMATIC.wav":
+        return f"_XTTS_/AUTOMATIC_{segment['speaker']}.wav"
+    return tts_name
+
+
+def _coqui_infer_segment(model, segment, speaker_wav, language, sampling_rate):
+    wav = model.tts(
+        text=segment["text"],
+        speaker_wav=speaker_wav,
+        language=language,
+    )
+    save_tts_segment_file(segment, wav, sampling_rate, language)
+
+
 def segments_coqui_tts(
     filtered_coqui_segments,
     TRANSLATE_AUDIO_TO,
@@ -643,45 +792,78 @@ def segments_coqui_tts(
     device = os.environ.get("SONITR_DEVICE")
     model = TTS(model_id_coqui).to(device)
     sampling_rate = 24000
+    speaker_latents_cache = {}
+    tts_model = getattr(model.synthesizer, "tts_model", None)
 
-    # filtered_segments = filtered_coqui_segments['segments']
-    # Sorting the segments by 'tts_name'
-    # sorted_segments = sorted(filtered_segments, key=lambda x: x['tts_name'])
-    # logger.debug(sorted_segments)
+    grouped_segments = group_segments_by_key(
+        filtered_coqui_segments["segments"], _resolve_coqui_speaker_wav
+    )
 
-    for segment in tqdm(filtered_coqui_segments["segments"]):
-        speaker = segment["speaker"]
-        text = segment["text"]
-        start = segment["start"]
-        tts_name = segment["tts_name"]
-        if tts_name == "_XTTS_/AUTOMATIC.wav":
-            tts_name = f"_XTTS_/AUTOMATIC_{speaker}.wav"
+    for speaker_wav, voice_segments in grouped_segments.items():
+        if (
+            tts_model is not None
+            and hasattr(tts_model, "get_conditioning_latents")
+            and speaker_wav not in speaker_latents_cache
+        ):
+            try:
+                speaker_latents_cache[speaker_wav] = (
+                    tts_model.get_conditioning_latents(audio_path=speaker_wav)
+                )
+            except Exception as error:
+                logger.warning(
+                    f"Could not cache XTTS speaker latents for "
+                    f"{speaker_wav}: {error}"
+                )
 
-        # make the tts audio
-        filename = f"audio/{start}.ogg"
-        logger.info(f"{text} >> {filename}")
-        try:
-            # Infer
-            wav = model.tts(
-                text=text, speaker_wav=tts_name, language=TRANSLATE_AUDIO_TO
-            )
-            data_tts = pad_array(
-                wav,
-                sampling_rate,
-            )
-            # Save file
-            write_chunked(
-                file=filename,
-                samplerate=sampling_rate,
-                data=data_tts,
-                format="ogg",
-                subtype="vorbis",
-            )
-            verify_saved_file_and_size(filename)
-        except Exception as error:
-            error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
-        gc.collect()
-        torch.cuda.empty_cache()
+        for batch in tqdm(
+            list(iter_segment_batches(voice_segments)),
+            desc=f"Coqui XTTS ({speaker_wav})",
+        ):
+            latents = speaker_latents_cache.get(speaker_wav)
+            if (
+                latents is not None
+                and tts_model is not None
+                and hasattr(tts_model, "inference")
+            ):
+                gpt_cond_latent, speaker_embedding = latents
+                for segment in batch:
+                    try:
+                        wav = tts_model.inference(
+                            segment["text"],
+                            TRANSLATE_AUDIO_TO,
+                            gpt_cond_latent,
+                            speaker_embedding,
+                        )
+                        if isinstance(wav, dict):
+                            wav = wav["wav"]
+                        save_tts_segment_file(
+                            segment, wav, sampling_rate, TRANSLATE_AUDIO_TO
+                        )
+                    except Exception as error:
+                        error_handling_in_tts(
+                            error,
+                            segment,
+                            TRANSLATE_AUDIO_TO,
+                            f"audio/{segment['start']}.ogg",
+                        )
+            else:
+                for segment in batch:
+                    try:
+                        _coqui_infer_segment(
+                            model,
+                            segment,
+                            speaker_wav,
+                            TRANSLATE_AUDIO_TO,
+                            sampling_rate,
+                        )
+                    except Exception as error:
+                        error_handling_in_tts(
+                            error,
+                            segment,
+                            TRANSLATE_AUDIO_TO,
+                            f"audio/{segment['start']}.ogg",
+                        )
+
     try:
         del model
         gc.collect()
@@ -805,6 +987,15 @@ def synthesize_text_to_audio_np_array(voice, text, synthesize_args):
     return audio_np
 
 
+def _synthesize_piper_segment(model, segment, synthesize_args, sampling_rate, translate_audio_to):
+    speech_output = synthesize_text_to_audio_np_array(
+        model, segment["text"], synthesize_args
+    )
+    save_tts_segment_file(
+        segment, speech_output, sampling_rate, translate_audio_to
+    )
+
+
 def segments_vits_onnx_tts(filtered_onnx_vits_segments, TRANSLATE_AUDIO_TO):
     """
     Install:
@@ -827,57 +1018,66 @@ def segments_vits_onnx_tts(filtered_onnx_vits_segments, TRANSLATE_AUDIO_TO):
     }
 
     filtered_segments = filtered_onnx_vits_segments["segments"]
-    # Sorting the segments by 'tts_name'
-    sorted_segments = sorted(filtered_segments, key=lambda x: x["tts_name"])
-    logger.debug(sorted_segments)
+    grouped_segments = group_segments_by_key(
+        filtered_segments,
+        lambda s: s["tts_name"].replace(" VITS-onnx", ""),
+    )
 
-    model_name_key = None
-    for segment in tqdm(sorted_segments):
-        speaker = segment["speaker"] # noqa
-        text = segment["text"]
-        start = segment["start"]
-        tts_name = segment["tts_name"].replace(" VITS-onnx", "")
+    for tts_name, voice_segments in grouped_segments.items():
+        model = load_piper_model(
+            tts_name, data_dir, download_dir, update_voices
+        )
+        sampling_rate = model.config.sample_rate
 
-        if tts_name != model_name_key:
-            model_name_key = tts_name
-            model = load_piper_model(
-                tts_name, data_dir, download_dir, update_voices
-            )
-            sampling_rate = model.config.sample_rate
-
-        # make the tts audio
-        filename = f"audio/{start}.ogg"
-        logger.info(f"{text} >> {filename}")
+        for batch in tqdm(
+            list(iter_segment_batches(voice_segments)),
+            desc=f"PIPER TTS ({tts_name})",
+        ):
+            for segment in batch:
+                try:
+                    _synthesize_piper_segment(
+                        model,
+                        segment,
+                        synthesize_args,
+                        sampling_rate,
+                        TRANSLATE_AUDIO_TO,
+                    )
+                except Exception as error:
+                    error_handling_in_tts(
+                        error,
+                        segment,
+                        TRANSLATE_AUDIO_TO,
+                        f"audio/{segment['start']}.ogg",
+                    )
         try:
-            # Infer
-            speech_output = synthesize_text_to_audio_np_array(
-                model, text, synthesize_args
-            )
-            data_tts = pad_array(
-                speech_output,  # .cpu().numpy().squeeze().astype(np.float32),
-                sampling_rate,
-            )
-            # Save file
-            write_chunked(
-                file=filename,
-                samplerate=sampling_rate,
-                data=data_tts,
-                format="ogg",
-                subtype="vorbis",
-            )
-            verify_saved_file_and_size(filename)
+            del model
         except Exception as error:
-            error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
-        gc.collect()
-        torch.cuda.empty_cache()
+            logger.error(str(error))
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _process_openai_segment(segment, client, translate_audio_to, sampling_rate):
+    text = segment["text"].strip()
+    tts_name = segment["tts_name"]
+    filename = f"audio/{segment['start']}.ogg"
+    logger.info(f"{text} >> {filename}")
     try:
-        del model
-        gc.collect()
-        torch.cuda.empty_cache()
+        response = client.audio.speech.create(
+            model="tts-1-hd" if "HD" in tts_name else "tts-1",
+            voice=tts_name.split()[0][1:],
+            response_format="wav",
+            input=text,
+        )
+        audio_bytes = b""
+        for data in response.iter_bytes(chunk_size=4096):
+            audio_bytes += data
+        speech_output = np.frombuffer(audio_bytes, dtype=np.int16)
+        save_tts_segment_file(
+            segment, speech_output[240:], sampling_rate, translate_audio_to
+        )
     except Exception as error:
-        logger.error(str(error))
-        gc.collect()
-        torch.cuda.empty_cache()
+        error_handling_in_tts(error, segment, translate_audio_to, filename)
 
 
 # =====================================
@@ -892,53 +1092,24 @@ def segments_openai_tts(
 
     client = OpenAI()
     sampling_rate = 24000
+    segments = filtered_openai_tts_segments["segments"]
+    batch_size = get_tts_batch_size()
 
-    # filtered_segments = filtered_openai_tts_segments['segments']
-    # Sorting the segments by 'tts_name'
-    # sorted_segments = sorted(filtered_segments, key=lambda x: x['tts_name'])
-
-    for segment in tqdm(filtered_openai_tts_segments["segments"]):
-        speaker = segment["speaker"] # noqa
-        text = segment["text"].strip()
-        start = segment["start"]
-        tts_name = segment["tts_name"]
-
-        # make the tts audio
-        filename = f"audio/{start}.ogg"
-        logger.info(f"{text} >> {filename}")
-
-        try:
-            # Request
-            response = client.audio.speech.create(
-                model="tts-1-hd" if "HD" in tts_name else "tts-1",
-                voice=tts_name.split()[0][1:],
-                response_format="wav",
-                input=text
-            )
-
-            audio_bytes = b''
-            for data in response.iter_bytes(chunk_size=4096):
-                audio_bytes += data
-
-            speech_output = np.frombuffer(audio_bytes, dtype=np.int16)
-
-            # Save file
-            data_tts = pad_array(
-                speech_output[240:],
+    with ThreadPoolExecutor(max_workers=batch_size) as executor:
+        futures = {
+            executor.submit(
+                _process_openai_segment,
+                segment,
+                client,
+                TRANSLATE_AUDIO_TO,
                 sampling_rate,
-            )
-
-            write_chunked(
-                file=filename,
-                samplerate=sampling_rate,
-                data=data_tts,
-                format="ogg",
-                subtype="vorbis",
-            )
-            verify_saved_file_and_size(filename)
-
-        except Exception as error:
-            error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
+            ): segment
+            for segment in segments
+        }
+        for future in tqdm(
+            as_completed(futures), total=len(futures), desc="OpenAI TTS"
+        ):
+            future.result()
 
 
 # =====================================
