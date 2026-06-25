@@ -444,18 +444,24 @@ def uromanize(input_string):
     return stdout.decode()[:-1]
 
 
+def _torch_inputs_to_device(inputs, device):
+    return {key: value.to(device) for key, value in inputs.items()}
+
+
 def segments_vits_tts(filtered_vits_segments, TRANSLATE_AUDIO_TO):
     from transformers import VitsModel, AutoTokenizer
 
+    device = os.environ.get("SONITR_DEVICE", "cpu")
     filtered_segments = filtered_vits_segments["segments"]
     grouped_segments = group_segments_by_key(
         filtered_segments, lambda s: s["tts_name"]
     )
 
     for tts_name, voice_segments in grouped_segments.items():
-        model = VitsModel.from_pretrained(VITS_VOICES_LIST[tts_name])
+        model = VitsModel.from_pretrained(VITS_VOICES_LIST[tts_name]).to(device)
         tokenizer = AutoTokenizer.from_pretrained(VITS_VOICES_LIST[tts_name])
         sampling_rate = model.config.sampling_rate
+        logger.info(f"VITS TTS ({tts_name}) running on {device}")
 
         for batch in tqdm(
             list(iter_segment_batches(voice_segments)),
@@ -469,7 +475,10 @@ def segments_vits_tts(filtered_vits_segments, TRANSLATE_AUDIO_TO):
                     logger.debug(f"Romanize text: {text}")
                 texts.append(text)
             try:
-                inputs = tokenizer(texts, return_tensors="pt", padding=True)
+                inputs = _torch_inputs_to_device(
+                    tokenizer(texts, return_tensors="pt", padding=True),
+                    device,
+                )
                 with torch.no_grad():
                     speech_outputs = model(**inputs).waveform
                 for i, segment in enumerate(batch):
@@ -493,7 +502,10 @@ def segments_vits_tts(filtered_vits_segments, TRANSLATE_AUDIO_TO):
                         text = segment["text"]
                         if tokenizer.is_uroman:
                             text = uromanize(text)
-                        inputs = tokenizer(text, return_tensors="pt")
+                        inputs = _torch_inputs_to_device(
+                            tokenizer(text, return_tensors="pt"),
+                            device,
+                        )
                         with torch.no_grad():
                             speech_output = model(**inputs).waveform
                         audio_data = (
