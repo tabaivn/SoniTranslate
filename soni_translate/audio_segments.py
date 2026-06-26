@@ -6,6 +6,7 @@ import soundfile as sf
 DEFAULT_SAMPLE_RATE = 48000
 FFMPEG_MIX_BATCH_SIZE = 200
 WAV_RF64_BYTE_THRESHOLD = 3_500_000_000
+DUB_DYNAUDNORM = "dynaudnorm=f=150:g=25:p=0.95:m=100:s=12"
 
 
 def _probe_audio(path):
@@ -82,17 +83,17 @@ def _compute_segment_starts(segments, audio_files, avoid_overlap):
     return starts
 
 
-def _build_mix_filter_lines(starts, sample_rate, channels):
+def _build_mix_filter_lines(starts, sample_rate, channels, total_duration):
     layout = "mono" if channels == 1 else "stereo"
     lines = []
-    mix_labels = ["[0:a]"]
+    mix_labels = []
 
-    for index, start in enumerate(starts, start=1):
+    for index, start in enumerate(starts):
         delay_ms = int(start * 1000)
         delayed_label = f"d{index}"
         lines.append(
             f"[{index}:a]aresample={sample_rate},"
-            f"aformat=sample_fmts=s16:channel_layouts={layout},"
+            f"aformat=sample_fmts=fltp:channel_layouts={layout},"
             f"adelay={delay_ms}|{delay_ms}[{delayed_label}]"
         )
         mix_labels.append(f"[{delayed_label}]")
@@ -100,7 +101,10 @@ def _build_mix_filter_lines(starts, sample_rate, channels):
     mix_inputs = "".join(mix_labels)
     lines.append(
         f"{mix_inputs}amix=inputs={len(mix_labels)}:"
-        f"duration=first:dropout_transition=0[out]"
+        f"duration=longest:dropout_transition=0:normalize=0,"
+        f"aformat=sample_fmts=fltp:channel_layouts={layout},"
+        f"{DUB_DYNAUDNORM},"
+        f"apad=whole_dur={total_duration}[out]"
     )
     return lines
 
@@ -117,16 +121,14 @@ def _mix_single_pass(
         _write_silence(output_path, total_duration, sample_rate, channels)
         return
 
-    layout = "mono" if channels == 1 else "stereo"
     filter_script = "_temp_dub_filter.txt"
-    inputs = (
-        f'-f lavfi -i anullsrc=channel_layout={layout}:'
-        f'sample_rate={sample_rate}:d={total_duration}'
-    )
+    inputs = ""
     for audio_file in audio_files:
         inputs += f' -i "{audio_file}"'
 
-    filter_lines = _build_mix_filter_lines(starts, sample_rate, channels)
+    filter_lines = _build_mix_filter_lines(
+        starts, sample_rate, channels, total_duration
+    )
     with open(filter_script, "w", encoding="utf-8") as script_file:
         script_file.write(";\n".join(filter_lines))
 
@@ -155,7 +157,8 @@ def _amix_existing_tracks(track_files, output_path, sample_rate, channels, durat
     mix_inputs = "".join(f"[{idx}:a]" for idx in range(len(track_files)))
     filter_complex = (
         f"{mix_inputs}amix=inputs={len(track_files)}:"
-        f"duration=first:dropout_transition=0[out]"
+        f"duration=first:dropout_transition=0:normalize=0,"
+        f"alimiter=limit=0.95:level=disabled[out]"
     )
     output_args = _ffmpeg_output_args(
         output_path, sample_rate, channels, duration_sec

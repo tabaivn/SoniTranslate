@@ -1,4 +1,6 @@
 import gradio as gr
+from soni_translate.gradio_theme import resolve_gradio_theme
+from soni_translate.gradio_runtime import build_gradio_launch_kwargs, configure_gradio_runtime_env
 import torch
 from unittest.mock import patch
 
@@ -18,6 +20,7 @@ import whisperx
 import torch
 import os
 from soni_translate.audio_segments import create_translated_audio
+from soni_translate.audio_mix import mix_original_and_dub
 from soni_translate.text_to_speech import (
     audio_segmentation_to_voice,
     edge_tts_voices_list,
@@ -336,10 +339,11 @@ class SoniTranslate(SoniTrCache):
             xtts_enabled = False
             logger.info("Coqui XTTS disabled")
         try:
-            from vieneu import Vieneu  # noqa
+            from soni_translate.vieneu_runtime import verify_vieneu_runtime
 
+            verify_vieneu_runtime()
             vieneu_enabled = True
-            logger.info("VieNeu-TTS enabled")
+            logger.info("VieNeu-TTS enabled (isolated venv)")
         except Exception as error:
             logger.debug(str(error))
             vieneu_enabled = False
@@ -430,8 +434,8 @@ class SoniTranslate(SoniTrCache):
         mix_method_audio="Adjusting volumes and mixing audio",
         max_accelerate_audio=2.1,
         acceleration_rate_regulation=False,
-        volume_original_audio=0.25,
-        volume_translated_audio=1.80,
+        volume_original_audio=0.05,
+        volume_translated_audio=1.0,
         output_format_subtitle="srt",
         get_translated_text=False,
         get_video_from_text_json=False,
@@ -1103,19 +1107,28 @@ class SoniTranslate(SoniTrCache):
         ], {}):
             # TYPE MIX AUDIO
             remove_files(mix_audio_file)
-            command_volume_mix = f'ffmpeg -y -i {base_audio_wav} -i {dub_audio_file} -filter_complex "[0:0]volume={volume_original_audio}[a];[1:0]volume={volume_translated_audio}[b];[a][b]amix=inputs=2:duration=longest" -c:a libmp3lame {mix_audio_file}'
-            command_background_mix = f'ffmpeg -i {base_audio_wav} -i {dub_audio_file} -filter_complex "[1:a]asplit=2[sc][mix];[0:a][sc]sidechaincompress=threshold=0.003:ratio=20[bg]; [bg][mix]amerge[final]" -map [final] {mix_audio_file}'
-            if mix_method_audio == "Adjusting volumes and mixing audio":
-                # volume mix
-                run_command(command_volume_mix)
-            else:
-                try:
-                    # background mix
-                    run_command(command_background_mix)
-                except Exception as error_mix:
-                    # volume mix except
-                    logger.error(str(error_mix))
-                    run_command(command_volume_mix)
+            use_sidechain = (
+                mix_method_audio != "Adjusting volumes and mixing audio"
+            )
+            try:
+                mix_original_and_dub(
+                    base_audio_wav,
+                    dub_audio_file,
+                    mix_audio_file,
+                    volume_original=volume_original_audio,
+                    volume_translated=volume_translated_audio,
+                    use_sidechain=use_sidechain,
+                )
+            except Exception as error_mix:
+                logger.error(str(error_mix))
+                mix_original_and_dub(
+                    base_audio_wav,
+                    dub_audio_file,
+                    mix_audio_file,
+                    volume_original=volume_original_audio,
+                    volume_translated=volume_translated_audio,
+                    use_sidechain=False,
+                )
 
         if "audio" in output_type or is_audio_file(media_file):
             output = media_out(
@@ -1155,7 +1168,8 @@ class SoniTranslate(SoniTrCache):
         if not self.task_in_cache("output", [
             hash_base_video_file,
             hash_base_audio_wav,
-            burn_subtitles_to_video
+            burn_subtitles_to_video,
+            get_hash(mix_audio_file) if os.path.exists(mix_audio_file) else None,
         ], {}):
             # Merge new audio + video
             remove_files(video_output_file)
@@ -1463,7 +1477,7 @@ title = "<center><strong><font size='7'>📽️ SoniTranslate 🈷️</font></st
 
 
 def create_gui(theme, logs_in_gui=False):
-    with gr.Blocks(theme=theme) as app:
+    with gr.Blocks(theme=resolve_gradio_theme(theme)) as app:
         gr.Markdown(title)
         gr.Markdown(lg_conf["description"])
 
@@ -1799,7 +1813,7 @@ def create_gui(theme, logs_in_gui=False):
                             volume_original_mix = gr.Slider(
                                 label=lg_conf["vol_ori"],
                                 info="for Adjusting volumes and mixing audio",
-                                value=0.25,
+                                value=0.05,
                                 step=0.05,
                                 minimum=0.0,
                                 maximum=2.50,
@@ -1809,7 +1823,7 @@ def create_gui(theme, logs_in_gui=False):
                             volume_translated_mix = gr.Slider(
                                 label=lg_conf["vol_tra"],
                                 info="for Adjusting volumes and mixing audio",
-                                value=1.80,
+                                value=1.0,
                                 step=0.05,
                                 minimum=0.0,
                                 maximum=2.50,
@@ -2811,11 +2825,12 @@ def create_parser():
     parser.add_argument(
         "--theme",
         type=str,
-        default="Taithrah/Minimal",
+        default="soft",
         help=(
-            "Specify the theme; find themes in "
-            "https://huggingface.co/spaces/gradio/theme-gallery;"
-            " Example: --theme aliabid94/new-theme"
+            "Gradio built-in theme: soft, default, monochrome, glass "
+            "(availability depends on installed gradio version). "
+            "Hugging Face theme ids work when SONITR_ALLOW_HF_THEME=1. "
+            "Example: --theme soft"
         ),
     )
     parser.add_argument(
@@ -2856,6 +2871,8 @@ def create_parser():
 
 if __name__ == "__main__":
 
+    configure_gradio_runtime_env()
+
     parser = create_parser()
 
     args = parser.parse_args()
@@ -2880,10 +2897,4 @@ if __name__ == "__main__":
 
     app.queue()
 
-    app.launch(
-        max_threads=1,
-        share=args.public_url,
-        show_error=True,
-        quiet=False,
-        debug=(True if logger.isEnabledFor(logging.DEBUG) else False),
-    )
+    app.launch(**build_gradio_launch_kwargs(args, logger))

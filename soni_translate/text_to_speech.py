@@ -84,6 +84,17 @@ def error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename):
         verify_saved_file_and_size(filename)
 
 
+def normalize_segment_peak(array, target_peak=0.95):
+    if isinstance(array, list):
+        array = np.array(array)
+
+    peak = float(np.max(np.abs(array))) if array.size else 0.0
+    if peak <= 1e-6:
+        return array
+
+    return array * (target_peak / peak)
+
+
 def pad_array(array, sr):
 
     if isinstance(array, list):
@@ -133,7 +144,9 @@ def save_tts_segment_file(segment, audio_data, sampling_rate, translate_audio_to
     filename = f"audio/{segment['start']}.ogg"
     logger.info(f"{segment['text']} >> {filename}")
     try:
-        data_tts = pad_array(audio_data, sampling_rate)
+        data_tts = normalize_segment_peak(
+            pad_array(audio_data, sampling_rate)
+        )
         write_chunked(
             file=filename,
             samplerate=sampling_rate,
@@ -219,7 +232,7 @@ def _process_edge_segment(segment, TRANSLATE_AUDIO_TO, is_gui):
         verify_saved_file_and_size(temp_file)
 
         data, sample_rate = sf.read(temp_file)
-        data = pad_array(data, sample_rate)
+        data = normalize_segment_peak(pad_array(data, sample_rate))
         write_chunked(
             file=filename,
             samplerate=sample_rate,
@@ -249,7 +262,7 @@ async def _edge_tts_batch_async(segments, translate_audio_to, is_gui, max_concur
                 ).save(temp_file)
                 verify_saved_file_and_size(temp_file)
                 data, sample_rate = sf.read(temp_file)
-                data = pad_array(data, sample_rate)
+                data = normalize_segment_peak(pad_array(data, sample_rate))
                 write_chunked(
                     file=filename,
                     samplerate=sample_rate,
@@ -1144,6 +1157,22 @@ def _vieneu_apply_watermark(model, wav):
 
 
 def segments_vieneu_tts(filtered_vieneu_segments, TRANSLATE_AUDIO_TO):
+    from .vieneu_runtime import run_vieneu_tts_subprocess
+
+    if os.environ.get("SONITR_VIENEU_INPROCESS", "0") == "1":
+        segments_vieneu_tts_inprocess(filtered_vieneu_segments, TRANSLATE_AUDIO_TO)
+        return
+
+    run_vieneu_tts_subprocess(
+        filtered_vieneu_segments,
+        TRANSLATE_AUDIO_TO,
+        get_tts_batch_size(),
+    )
+
+
+def segments_vieneu_tts_inprocess(
+    filtered_vieneu_segments, TRANSLATE_AUDIO_TO, batch_size=None
+):
     try:
         from vieneu import Vieneu
     except ImportError as error:
@@ -1167,6 +1196,7 @@ def segments_vieneu_tts(filtered_vieneu_segments, TRANSLATE_AUDIO_TO):
     )
 
     batch_engine = None
+    tts_batch_size = batch_size if batch_size is not None else get_tts_batch_size()
     if getattr(model, "backend", None) == "pytorch" and vieneu_device == "cuda":
         try:
             from vieneu.v3_turbo_serve.engine import V3TurboBatchEngine
@@ -1185,7 +1215,7 @@ def segments_vieneu_tts(filtered_vieneu_segments, TRANSLATE_AUDIO_TO):
         preset = model.get_preset_voice(voice_id)
 
         for batch in tqdm(
-            list(iter_segment_batches(voice_segments)),
+            list(iter_segment_batches(voice_segments, batch_size=tts_batch_size)),
             desc=f"VieNeu-TTS ({voice_id})",
         ):
             if batch_engine and len(batch) > 1:
@@ -1811,6 +1841,8 @@ def toneconverter_freevc(
                 source_wav=src_path,
                 target_wav=original_wav_audio_segment,
             )
+
+            wav = normalize_segment_peak(np.asarray(wav))
 
             write_chunked(
                 file=save_path,

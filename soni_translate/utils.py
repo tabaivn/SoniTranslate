@@ -47,20 +47,47 @@ SUBTITLE_EXTENSIONS = [
 ]
 
 
-def run_command(command):
-    logger.debug(command)
-    if isinstance(command, str):
-        command = shlex.split(command)
-
-    sub_params = {
+def subprocess_popen_kwargs():
+    return {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "creationflags": subprocess.CREATE_NO_WINDOW
         if sys.platform == "win32"
         else 0,
     }
-    process_command = subprocess.Popen(command, **sub_params)
-    output, errors = process_command.communicate()
+
+
+def ffmpeg_command(*args):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise FileNotFoundError("ffmpeg not found on PATH")
+    return [ffmpeg, *args]
+
+
+def ffprobe_command(*args):
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise FileNotFoundError("ffprobe not found on PATH")
+    return [ffprobe, *args]
+
+
+def yt_dlp_command(*args):
+    """Always invoke yt-dlp through the running interpreter (Docker has no `python`)."""
+    return [sys.executable, "-m", "yt_dlp", *args]
+
+
+def run_subprocess(command):
+    if isinstance(command, str):
+        command = shlex.split(command)
+    logger.debug(command)
+    process = subprocess.Popen(command, **subprocess_popen_kwargs())
+    output, errors = process.communicate()
+    return process, output, errors
+
+
+def run_command(command):
+    logger.debug(command)
+    process_command, output, errors = run_subprocess(command)
     if (
         process_command.returncode != 0
     ):  # or not os.path.exists(mono_path) or os.path.getsize(mono_path) == 0:

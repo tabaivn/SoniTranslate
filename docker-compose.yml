@@ -1,0 +1,42 @@
+services:
+  sonitranslate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Build once (slow, ~30-60 min). Subsequent pod/container starts are fast.
+      # Use: DOCKER_BUILDKIT=1 docker compose build
+    image: sonitranslate:latest
+    ports:
+      - "7860:7860"
+    environment:
+      YOUR_HF_TOKEN: ${YOUR_HF_TOKEN:-}
+      GRADIO_SERVER_NAME: 0.0.0.0
+      GRADIO_SERVER_PORT: 7860
+      SONITR_DEVICE: cuda
+      SONITR_LANGUAGE: ${SONITR_LANGUAGE:-english}
+      SONITR_THEME: ${SONITR_THEME:-soft}
+      SONITR_ALLOW_HF_THEME: ${SONITR_ALLOW_HF_THEME:-0}
+      SONITR_VERBOSITY: ${SONITR_VERBOSITY:-info}
+      SONITR_CPU_MODE: ${SONITR_CPU_MODE:-0}
+      SONITR_PUBLIC_URL: ${SONITR_PUBLIC_URL:-0}
+      HF_HOME: /workspace/.cache/huggingface
+      PIP_CACHE_DIR: /workspace/.cache/pip
+      SONITR_DEPS_VERSION: 4
+    volumes:
+      - sonitr-workspace:/workspace
+      - sonitr-weights:/app/weights
+      - sonitr-downloads:/app/downloads
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: "8gb"
+    restart: unless-stopped
+
+volumes:
+  sonitr-workspace:
+  sonitr-weights:
+  sonitr-downloads:
